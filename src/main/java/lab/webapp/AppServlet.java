@@ -7,31 +7,32 @@ import javax.servlet.http.HttpServletRequest;
 import javax.servlet.http.HttpServletResponse;
 import java.io.IOException;
 import java.io.PrintWriter;
-import java.nio.file.Files;
-import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.sql.*;
 import java.util.UUID;
 
 @WebServlet(value = "/", loadOnStartup = 1)
 public class AppServlet extends HttpServlet {
-    private String jdbcUrl;
+    private DatabaseConfig database;
     private String instance;
 
     @Override public void init() throws ServletException {
         try {
-            String directory = getServletContext().getRealPath("/WEB-INF/db");
+            String directory = getServletContext().getRealPath("/");
             if (directory == null) throw new ServletException("Tomcat unpackWARs=true is required");
-            Path dbDirectory = Paths.get(directory);
-            Files.createDirectories(dbDirectory);
-            jdbcUrl = "jdbc:sqlite:" + dbDirectory.resolve("taskpebble.sqlite").toAbsolutePath();
+            String envFile = System.getProperty("taskpebble.env", getServletConfig().getInitParameter("envFile"));
+            database = DatabaseConfig.load(Paths.get(directory), envFile);
             String configured = System.getenv("APM_INSTANCE_NAME");
             instance = configured == null || configured.trim().isEmpty()
                 ? System.getProperty("catalina.base", "local") : configured;
-            Class.forName("org.sqlite.JDBC");
+            Class.forName(database.maria ? "org.mariadb.jdbc.Driver" : "org.sqlite.JDBC");
             try (Connection connection = connect(); Statement statement = connection.createStatement()) {
-                statement.executeUpdate("CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)");
-                try (PreparedStatement seed = connection.prepareStatement("INSERT INTO entries(title, detail) SELECT ?, ? WHERE NOT EXISTS (SELECT 1 FROM entries)")) {
+                statement.executeUpdate(database.maria
+                    ? "CREATE TABLE IF NOT EXISTS entries (id BIGINT PRIMARY KEY AUTO_INCREMENT, title VARCHAR(120) NOT NULL, detail TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
+                    : "CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+                try (PreparedStatement seed = connection.prepareStatement(database.maria
+                    ? "INSERT IGNORE INTO entries(id,title,detail) VALUES (1,?,?)"
+                    : "INSERT OR IGNORE INTO entries(id,title,detail) VALUES (1,?,?)")) {
                     seed.setString(1, "Deploy webapp"); seed.setString(2, "TODO"); seed.executeUpdate();
                 }
             }
@@ -41,9 +42,12 @@ public class AppServlet extends HttpServlet {
     }
 
     private Connection connect() throws SQLException {
-        Connection connection = DriverManager.getConnection(jdbcUrl);
+        java.util.Properties credentials = new java.util.Properties();
+        credentials.setProperty("user", database.user); credentials.setProperty("password", database.password);
+        credentials.setProperty("connectTimeout", "5000"); credentials.setProperty("socketTimeout", "10000");
+        Connection connection = database.maria ? DriverManager.getConnection(database.url, credentials) : DriverManager.getConnection(database.url);
         try (Statement statement = connection.createStatement()) {
-            statement.execute("PRAGMA busy_timeout = 3000");
+            statement.execute(database.maria ? "SET time_zone = '+00:00'" : "PRAGMA busy_timeout = 3000");
         } catch (SQLException e) { connection.close(); throw e; }
         return connection;
     }
@@ -62,7 +66,7 @@ public class AppServlet extends HttpServlet {
             response.setContentType("application/json");
             try (Connection connection = connect(); Statement statement = connection.createStatement(); ResultSet rs = statement.executeQuery("SELECT 1")) {
                 if (!rs.next()) throw new SQLException("Database health query returned no row");
-                response.getWriter().write("{\"app\":\"TaskPebble\",\"status\":\"UP\",\"database\":\"UP\"}");
+                response.getWriter().write("{\"app\":\"TaskPebble\",\"status\":\"UP\",\"database\":\"UP\",\"backend\":\"" + (database.maria ? "MariaDB" : "SQLite") + "\"}");
             } catch (SQLException e) {
                 getServletContext().log("Health check failed", e);
                 response.setStatus(503);

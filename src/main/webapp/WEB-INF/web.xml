@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<web-app xmlns="http://xmlns.jcp.org/xml/ns/javaee" version="4.0">
+  <security-constraint>
+    <web-resource-collection><web-resource-name>Private runtime configuration</web-resource-name><url-pattern>/.env</url-pattern></web-resource-collection>
+    <auth-constraint/>
+  </security-constraint>
+</web-app>
