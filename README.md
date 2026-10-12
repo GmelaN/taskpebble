@@ -36,7 +36,7 @@ cp taskpebble.war "$CATALINA_BASE/webapps/"
 첫 실행 시 `webapps/taskpebble/WEB-INF/db/taskpebble.sqlite`가 자동 생성됩니다.
 Tomcat 실행 계정에 해당 디렉터리의 쓰기 권한이 필요합니다. DB 파일은 HTTP로 제공하지 않습니다.
 SQLite 모드에서는 각 VM/웹앱이 자기 DB를 사용합니다. MariaDB 설정은 아래를 참고하십시오. 한 Tomcat에 배포된 웹앱은 JVM 자원을 공유합니다.
-샘플 데이터는 시작 시 ID 1이 없으면 한 건 생성합니다. 화면은 최근 100건을 표시합니다.
+신규 계정은 빈 목록으로 시작합니다. 기존 소유자 없는 데이터는 보존하지만 로그인 사용자에게 노출하지 않습니다. 화면은 최근 100건을 표시합니다.
 재배포로 풀린 웹앱 폴더가 교체되면 DB가 사라질 수 있으므로 필요한 데이터는 Tomcat을 중지하고
 `WEB-INF/db` 디렉터리를 백업한 뒤 재배포·복원하십시오.
 
@@ -46,17 +46,17 @@ SQLite 모드에서는 각 VM/웹앱이 자기 DB를 사용합니다. MariaDB �
 `v*` 태그를 푸시하면 검증을 통과한 WAR와 `SHA256SUMS`를 GitHub Release에 첨부합니다.
 
 ```sh
-git tag v1.1.0
-git push origin v1.1.0
+git tag v1.2.0
+git push origin v1.2.0
 ```
 
-인증·사용자별 데이터 분리 없이 동작하는 테스트베드용 예제입니다.
+앱별 회원가입·로그인 세션과 사용자별 데이터 분리를 지원합니다.
 
 ## 중앙 MariaDB 설정 (.env)
 
 같은 프로젝트의 두 Tomcat 인스턴스는 같은 DB를 바라보도록 설정합니다.
 A/B/C는 같은 MariaDB 서버를 사용하되 각각 `memoharbor`, `cataloggrove`, `taskpebble` DB를 사용합니다.
-DB와 계정은 관리자 권한으로 먼저 생성하십시오. 앱은 시작할 때 테이블과 샘플 한 건을 준비합니다.
+DB와 계정은 관리자 권한으로 먼저 생성하십시오. 앱은 시작할 때 데이터·계정·소유권 테이블을 준비합니다.
 
 프로젝트 소스 루트에서 다음 파일을 만드십시오.
 
@@ -108,3 +108,16 @@ GitHub Actions는 실제 MariaDB 11.4 서비스를 띄워 두 Tomcat 인스턴�
 로컬에서 테스트할 때는 전용 테스트 DB의 `MARIADB_TEST_URL`, `MARIADB_TEST_USER`,
 `MARIADB_TEST_PASSWORD` 환경변수를 설정하고 `mvn verify`를 실행하십시오.
 미설정 시 MariaDB 통합 테스트는 건너뛰며 SQLite·설정 파서 테스트는 실행합니다.
+
+## 로그인과 사용자별 데이터
+
+- `GET /login`: 로그인·회원가입 화면. `POST /register`, `POST /login`, `POST /logout`: 폼 요청.
+- 아이디는 영문 소문자·숫자·밑줄 3–40자, 비밀번호는 12–128자입니다. 앱마다 별도의 계정을 사용합니다.
+- 비밀번호는 사용자별 무작위 salt와 PBKDF2-HMAC-SHA256 600,000회로 저장합니다.
+- 로그인·회원가입 성공 시 기존 세션을 폐기하고 새 세션을 발급합니다. 유휴 30분 만료, 로그아웃 시 폐기합니다.
+- JSESSIONID는 HttpOnly, 쿠키 전용입니다. 운영에서는 HTTPS를 사용하고 Tomcat의 세션 쿠키를 Secure 및 SameSite=Lax로 설정하십시오. 프록시를 사용할 때 Tomcat이 HTTPS 요청을 인식하도록 구성해야 합니다.
+- 모든 POST는 화면의 `csrf` 필드가 필요합니다. 인증되지 않은 등록·삭제·로그아웃은 401, 토큰 오류는 403입니다. 홈 화면은 비로그인 시 로그인 화면으로 이동합니다.
+- 조회와 삭제는 서버 세션의 사용자 ID로 제한됩니다. 다른 사용자의 ID로 삭제를 요청해도 404입니다. `/health`는 계속 공개합니다.
+- 기존 `entries`는 변경하지 않고 `app_users`, `entry_owners` 및 조회 인덱스를 추가합니다. 기존 데이터는 자동으로 특정 사용자에게 배정하지 않습니다. 이전 데이터에 소유권을 배정하려면 백업 후 관리자가 검증된 사용자 ID로 `entry_owners(entry_id,user_id)`를 직접 등록하십시오.
+- 같은 앱의 두 Tomcat은 MariaDB 계정·데이터를 공유하지만 세션은 각 Tomcat 메모리에 있습니다. 로드밸런서에는 sticky session이 필요하며, 장애 시 로그인 유지가 필요하면 Tomcat 세션 복제를 별도로 구성하십시오. 재시작 후에는 다시 로그인합니다.
+- `mvn verify`는 실제 HTTP 세션, CSRF, 비밀번호 검증, 사용자 간 조회·삭제 차단, 재시작 후 데이터 유지 등을 검사합니다. MariaDB 테스트는 `MARIADB_TEST_*` 설정이 필요합니다.

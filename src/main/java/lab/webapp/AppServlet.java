@@ -30,11 +30,7 @@ public class AppServlet extends HttpServlet {
                 statement.executeUpdate(database.maria
                     ? "CREATE TABLE IF NOT EXISTS entries (id BIGINT PRIMARY KEY AUTO_INCREMENT, title VARCHAR(120) NOT NULL, detail TEXT NOT NULL, created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4"
                     : "CREATE TABLE IF NOT EXISTS entries (id INTEGER PRIMARY KEY AUTOINCREMENT, title TEXT NOT NULL, detail TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)");
-                try (PreparedStatement seed = connection.prepareStatement(database.maria
-                    ? "INSERT IGNORE INTO entries(id,title,detail) VALUES (1,?,?)"
-                    : "INSERT OR IGNORE INTO entries(id,title,detail) VALUES (1,?,?)")) {
-                    seed.setString(1, "Deploy webapp"); seed.setString(2, "TODO"); seed.executeUpdate();
-                }
+                Auth.initialize(connection, database.maria);
             }
         } catch (Exception e) {
             throw new ServletException("TaskPebble database initialization failed", e);
@@ -74,25 +70,32 @@ public class AppServlet extends HttpServlet {
             }
             return;
         }
+        if ("/login".equals(path)) { Auth.page(request, response, "TaskPebble"); return; }
         if (!"/".equals(path) && !path.isEmpty()) { response.sendError(404); return; }
+        Long userId = Auth.user(request);
+        if (userId == null) { Auth.redirect(request, response, "/login"); return; }
         response.setContentType("text/html");
         // Complete SQL work before writing a successful response.
         StringBuilder rows = new StringBuilder();
-        try (Connection connection = connect(); Statement statement = connection.createStatement(); ResultSet rs = statement.executeQuery("SELECT id,title,detail,created_at FROM entries ORDER BY id DESC LIMIT 100")) {
-            while (rs.next()) {
-                rows.append("<tr><td>").append(rs.getLong("id")).append("</td><td>").append(escape(rs.getString("title")))
-                    .append("</td><td class='detail'>").append(escape(rs.getString("detail")))
-                    .append("</td><td>").append(escape(rs.getString("created_at")))
-                    .append("</td><td><form method='post' action='").append(escape(request.getContextPath())).append("/delete'>")
-                    .append("<input type='hidden' name='id' value='").append(rs.getLong("id"))
-                    .append("'><button class='delete'>삭제</button></form></td></tr>");
+        try (Connection connection = connect(); PreparedStatement statement = connection.prepareStatement("SELECT e.id,e.title,e.detail,e.created_at FROM entries e JOIN entry_owners o ON o.entry_id=e.id WHERE o.user_id=? ORDER BY e.id DESC LIMIT 100")) {
+            statement.setLong(1, userId);
+            try (ResultSet rs = statement.executeQuery()) {
+                while (rs.next()) {
+                    rows.append("<tr><td>").append(rs.getLong("id")).append("</td><td>").append(escape(rs.getString("title")))
+                        .append("</td><td class='detail'>").append(escape(rs.getString("detail")))
+                        .append("</td><td>").append(escape(rs.getString("created_at")))
+                        .append("</td><td><form method='post' action='").append(escape(request.getContextPath())).append("/delete'>")
+                        .append(Auth.field(request)).append("<input type='hidden' name='id' value='").append(rs.getLong("id"))
+                        .append("'><button class='delete'>삭제</button></form></td></tr>");
+                }
             }
         } catch (SQLException e) { fail(response, e); return; }
         PrintWriter out = response.getWriter();
         out.println("<!doctype html><html lang='ko'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>TaskPebble</title>");
         out.println("<style>body{font:16px system-ui,sans-serif;background:#f3f6fa;color:#203048;margin:0}main{max-width:960px;margin:48px auto;padding:24px}h1{margin-bottom:8px}section{background:white;padding:24px;border-radius:12px;margin:24px 0}label{display:block;margin:12px 0}input,textarea,select{box-sizing:border-box;width:100%;padding:10px;border:1px solid #c9d2df;border-radius:5px}button{background:#2463ac;color:white;border:0;padding:10px 18px;border-radius:5px;cursor:pointer}table{width:100%;border-collapse:collapse}th,td{text-align:left;padding:12px;border-bottom:1px solid #dde4ee;overflow-wrap:anywhere}.detail{white-space:pre-wrap}.delete{background:#52647a}small{color:#627187}a{color:#2463ac}</style></head><body><main>");
         out.println("<small>APM TESTBED · PROJECT C</small><h1>TaskPebble</h1><p>독립형 작업 기록</p><small>Instance: " + escape(instance) + "</small>");
-        out.println("<section><h2>등록</h2><form method='post' action='" + escape(request.getContextPath()) + "/create'><label>작업명<input name='title' maxlength='120' required></label><label>상태<select name='detail'><option>TODO</option><option>DONE</option></select></label><button>등록</button></form></section>");
+        out.println("<p>사용자: " + escape((String) request.getSession(false).getAttribute("username")) + "</p><form method='post' action='" + escape(request.getContextPath()) + "/logout'>" + Auth.field(request) + "<button>로그아웃</button></form>");
+        out.println("<section><h2>등록</h2><form method='post' action='" + escape(request.getContextPath()) + "/create'>" + Auth.field(request) + "<label>작업명<input name='title' maxlength='120' required></label><label>상태<select name='detail'><option>TODO</option><option>DONE</option></select></label><button>등록</button></form></section>");
         out.println("<section><h2>최근 100건</h2><table><thead><tr><th>ID</th><th>작업명</th><th>상태</th><th>등록 시간 (UTC)</th><th></th></tr></thead><tbody>" + rows + "</tbody></table></section>");
         out.println("<a href='" + escape(request.getContextPath()) + "/health'>DB 상태 확인</a></main></body></html>");
     }
@@ -100,23 +103,48 @@ public class AppServlet extends HttpServlet {
     @Override protected void doPost(HttpServletRequest request, HttpServletResponse response) throws IOException {
         request.setCharacterEncoding("UTF-8"); begin(response);
         String path = request.getServletPath();
+        if (!"/register".equals(path) && !"/login".equals(path) && !"/logout".equals(path) && !"/create".equals(path) && !"/delete".equals(path)) { response.sendError(404); return; }
+        boolean account = "/register".equals(path) || "/login".equals(path);
+        Long userId = Auth.user(request);
+        if (!account && userId == null) { response.sendError(401, "Login required"); return; }
+        if (!Auth.csrf(request, response)) return;
         try {
+            if (account) {
+                try (Connection connection = connect()) { Auth.account(connection, request, response, "/register".equals(path)); }
+                return;
+            }
+            if ("/logout".equals(path)) { request.getSession(false).invalidate(); Auth.redirect(request, response, "/login"); return; }
             if ("/create".equals(path)) {
                 String title = request.getParameter("title"), detail = request.getParameter("detail");
                 if (title == null || title.trim().isEmpty() || title.length() > 120 || detail == null || detail.trim().isEmpty() || detail.length() > 1000 || (!"TODO".equals(detail) && !"DONE".equals(detail))) {
                     response.sendError(400, "Invalid title or detail"); return;
                 }
-                try (Connection connection = connect(); PreparedStatement statement = connection.prepareStatement("INSERT INTO entries(title,detail) VALUES (?,?)")) {
-                    statement.setString(1, title.trim()); statement.setString(2, detail.trim()); statement.executeUpdate();
+                try (Connection connection = connect()) {
+                    connection.setAutoCommit(false);
+                    try (PreparedStatement statement = connection.prepareStatement("INSERT INTO entries(title,detail) VALUES (?,?)", Statement.RETURN_GENERATED_KEYS)) {
+                        statement.setString(1, title.trim()); statement.setString(2, detail.trim()); statement.executeUpdate();
+                        try (ResultSet keys = statement.getGeneratedKeys(); PreparedStatement owner = connection.prepareStatement("INSERT INTO entry_owners(entry_id,user_id) VALUES (?,?)")) {
+                            if (!keys.next()) throw new SQLException("Missing entry key");
+                            owner.setLong(1, keys.getLong(1)); owner.setLong(2, userId); owner.executeUpdate();
+                        }
+                        connection.commit();
+                    } catch (SQLException e) { connection.rollback(); throw e; }
                 }
             } else if ("/delete".equals(path)) {
                 long id;
                 try { id = Long.parseLong(request.getParameter("id")); }
                 catch (NumberFormatException e) { response.sendError(400, "Invalid id"); return; }
                 if (id <= 0) { response.sendError(400, "Invalid id"); return; }
-                try (Connection connection = connect(); PreparedStatement statement = connection.prepareStatement("DELETE FROM entries WHERE id=?")) {
-                    statement.setLong(1, id);
-                    if (statement.executeUpdate() == 0) { response.sendError(404); return; }
+                try (Connection connection = connect()) {
+                    connection.setAutoCommit(false);
+                    try (PreparedStatement statement = connection.prepareStatement("DELETE FROM entries WHERE id=? AND id IN (SELECT entry_id FROM entry_owners WHERE user_id=?)")) {
+                        statement.setLong(1, id); statement.setLong(2, userId);
+                        if (statement.executeUpdate() == 0) { connection.rollback(); response.sendError(404); return; }
+                        try (PreparedStatement owner = connection.prepareStatement("DELETE FROM entry_owners WHERE entry_id=? AND user_id=?")) {
+                            owner.setLong(1, id); owner.setLong(2, userId); owner.executeUpdate();
+                        }
+                        connection.commit();
+                    } catch (SQLException e) { connection.rollback(); throw e; }
                 }
             } else { response.sendError(404); return; }
             response.setStatus(303); response.setHeader("Location", request.getContextPath() + "/");
